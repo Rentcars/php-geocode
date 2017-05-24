@@ -1,5 +1,5 @@
 {
-    "name": "kamranahmedse/php-geocode",
+    "name": "rentcars/php-geocode",
     "type": "library",
     "description": "A wrapper around the Google Geocoding API to get different details such as latitude, longitude, country, city, district, postcode, town and street number regarding some specific address.",
     "keywords": ["location", "address", "addresses", "google", "map", "maps", "gmap", "gmaps", "geocode", "geocoder", "geocoding"],
