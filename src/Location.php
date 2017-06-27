@@ -94,6 +94,18 @@ class Location
      */
     private $shortNeighborhood = '';
 
+    /** @var string Latitude Northeast */
+    private $latitudeNortheast = '';
+
+    /** @var string Longitude Northeast */
+    private $longitudeNortheast = '';
+
+    /** @var string Latitude Southwest */
+    private $latitudeSouthwest = '';
+
+    /** @var string Longitude Southwest */
+    private $longitudeSouthwest = '';
+
     /**
      * @var boolean Whether the location is valid or not
      */
@@ -139,6 +151,12 @@ class Location
 
         $this->latitude  = $locationDetail->results[0]->geometry->location->lat;
         $this->longitude = $locationDetail->results[0]->geometry->location->lng;
+
+        $this->latitudeNortheast = $locationDetail->results[0]->geometry->viewport->northeast->lat;
+        $this->longitudeNortheast = $locationDetail->results[0]->geometry->viewport->northeast->lng;
+
+        $this->latitudeSouthwest = $locationDetail->results[0]->geometry->viewport->southwest->lat;
+        $this->longitudeSouthwest = $locationDetail->results[0]->geometry->viewport->southwest->lng;
 
         foreach ($locationDetail->results[0]->address_components as $component) {
             if (in_array('street_number', $component->types)) {
@@ -369,5 +387,41 @@ class Location
     public function getShortNeighborhood($default = '')
     {
         return $this->shortNeighborhood ?: $default;
+    }
+
+    /**
+     * Gets the latitude northeast of the location
+     * @return string
+     */
+    public function getLatitudeNortheast($default = '')
+    {
+        return $this->latitudeNortheast ?: $default;
+    }
+
+    /**
+     * Gets the longitude northeast of the location
+     * @return string
+     */
+    public function getLongitudeNortheast($default = '')
+    {
+        return $this->longitudeNortheast ?: $default;
+    }
+
+    /**
+     * Gets the latitude southwest of the location
+     * @return string
+     */
+    public function getLatitudeSouthwest($default = '')
+    {
+        return $this->latitudeSouthwest ?: $default;
+    }
+
+    /**
+     * Gets the longitude southwest of the location
+     * @return string
+     */
+    public function getLongitudeSouthwest($default = '')
+    {
+        return $this->longitudeSouthwest ?: $default;
     }
 }
