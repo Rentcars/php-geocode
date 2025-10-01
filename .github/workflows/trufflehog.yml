@@ -1,0 +1,248 @@
+# TruffleHog OSS Secret Detection Workflow
+# 
+# 🔧 CONFIGURAÇÃO GENÉRICA:
+# Para usar este workflow em qualquer repositório:
+# 1. Adicione os secrets no repositório:
+#    - TRUFFLEHOG_SLACK_WEBHOOK_URL (obrigatório para notificações do canal)
+#    - SLACK_BOT_TOKEN (opcional para DMs diretos)
+# 2. Ajuste as branches em 'on.push.branches' conforme necessário
+# 3. O workflow funcionará automaticamente em PRs e pushes
+#
+name: TruffleHog OSS PR Scan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [ master ]  # Adicionando para testar no push também
+
+jobs:
+  trufflehog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Busca todo o histórico para comparação
+
+      - name: Run TruffleHog OSS and capture output
+        id: trufflehog
+        run: |
+          # Executa TruffleHog separando logs de dados (usando /tmp para evitar commit dos arquivos)
+          docker run --rm -v .:/tmp -w /tmp \
+            ghcr.io/trufflesecurity/trufflehog:latest \
+            git file:///tmp/ \
+            --since-commit ${{ github.event.repository.default_branch }} \
+            --branch HEAD \
+            --json \
+            --no-update \
+            --github-actions 2>/tmp/trufflehog_logs.txt 1>/tmp/trufflehog_secrets.json || echo "TruffleHog finished with findings"
+          
+          echo "📄 Logs do TruffleHog:"
+          cat /tmp/trufflehog_logs.txt
+          
+          echo "🔍 Dados dos segredos:"
+          cat /tmp/trufflehog_secrets.json
+          
+          # Filtra apenas as linhas que são dados de segredos (contém SourceMetadata)
+          secrets_data=$(cat /tmp/trufflehog_secrets.json | grep '"SourceMetadata"')
+          
+          if [ -n "$secrets_data" ]; then
+            secrets_count=$(echo "$secrets_data" | wc -l)
+            echo "🔍 Encontrados $secrets_count segredos!"
+            
+            # Extrai os arquivos únicos onde segredos foram encontrados
+            files_with_secrets=$(echo "$secrets_data" | grep -o '"file":"[^"]*' | cut -d'"' -f4 | sort -u | head -10)
+            
+            if [ -n "$files_with_secrets" ]; then
+              echo "📁 Arquivos com segredos detectados:"
+              echo "$files_with_secrets"
+              
+              # Formata a lista de arquivos de forma mais simples (sem backticks para evitar problemas)
+              files_list=$(echo "$files_with_secrets" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+              
+              echo "📋 Lista formatada: $files_list"
+              echo "files_with_secrets=$files_list" >> $GITHUB_OUTPUT
+              echo "secrets_found=true" >> $GITHUB_OUTPUT
+            else
+              echo "❌ Nenhum arquivo extraído dos dados"
+              echo "secrets_found=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "✅ Nenhum segredo encontrado"
+            echo "secrets_found=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Verificar se segredos foram encontrados
+        id: check_secrets
+        run: |
+          echo "🔍 DEBUG: secrets_found do step anterior: '${{ steps.trufflehog.outputs.secrets_found }}'"
+          echo "📁 DEBUG: files_with_secrets do step anterior: '${{ steps.trufflehog.outputs.files_with_secrets }}'"
+          
+          if [ "${{ steps.trufflehog.outputs.secrets_found }}" == "true" ]; then
+            echo "✅ Confirmando que segredos foram encontrados"
+            echo "secrets_found=true" >> $GITHUB_OUTPUT
+            echo "files_with_secrets=${{ steps.trufflehog.outputs.files_with_secrets }}" >> $GITHUB_OUTPUT
+            echo "📋 DEBUG: Passando files_with_secrets: '${{ steps.trufflehog.outputs.files_with_secrets }}'"
+          else
+            echo "❌ Nenhum segredo confirmado"
+            echo "secrets_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comentar no PR se encontrar segredos
+        if: steps.check_secrets.outputs.secrets_found == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: commits } = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            const lastCommit = commits[commits.length - 1];
+            const commitAuthor = lastCommit.commit.author.name || 'Desconhecido';
+            const commitEmail = lastCommit.commit.author.email || 'email não disponível';
+            const commitMessage = lastCommit.commit.message || 'Mensagem não disponível';
+            const commitSha = lastCommit.sha;
+            const prAuthor = '${{ github.event.pull_request.user.login }}';
+            const filesWithSecrets = '${{ steps.check_secrets.outputs.files_with_secrets }}';
+            
+            let filesInfo = '';
+            if (filesWithSecrets && filesWithSecrets.trim() !== '' && filesWithSecrets !== ', , ') {
+              // Formatar arquivos para markdown com backticks
+              const formattedFiles = filesWithSecrets.split(',').map(f => f.trim()).filter(f => f).map(f => `\`${f}\``).join(', ');
+              filesInfo = `\n\n:file_folder: **Arquivos com segredos:** ${formattedFiles}`;
+            }
+            
+            const body = `:warning: **TruffleHog encontrou possíveis segredos neste PR!**
+            
+            :bust_in_silhouette: **Autor do PR:** @${prAuthor}
+            :memo: **Commit:** \`${commitSha.substring(0, 7)}\` por ${commitAuthor}
+            :email: **Email:** ${commitEmail}
+            :speech_balloon: **Mensagem do commit:** ${commitMessage}${filesInfo}
+            
+            :exclamation: **Por favor, revise e remova qualquer segredo exposto antes de fazer merge!**
+            
+            :information_source: Os segredos foram detectados pelo TruffleHog OSS. Verifique os logs do workflow para mais detalhes.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Send Slack notification if secrets found
+        if: steps.check_secrets.outputs.secrets_found == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.TRUFFLEHOG_SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          echo "🔍 Verificando configuração do Slack..."
+          echo "🎯 DEBUG: secrets_found: '${{ steps.check_secrets.outputs.secrets_found }}'"
+          echo "📁 DEBUG: files_with_secrets: '${{ steps.check_secrets.outputs.files_with_secrets }}'"
+          
+          # Capturar informações do commit/usuário
+          GITHUB_USER="${{ github.actor }}"
+          COMMIT_SHA="${{ github.sha }}"
+          FILES_WITH_SECRETS="${{ steps.check_secrets.outputs.files_with_secrets }}"
+          
+          echo "📋 DEBUG: Variável FILES_WITH_SECRETS: '$FILES_WITH_SECRETS'"
+          
+          # Adicionar informação dos arquivos à mensagem
+          if [ -n "$FILES_WITH_SECRETS" ] && [ "$FILES_WITH_SECRETS" != "" ] && [ "$FILES_WITH_SECRETS" != ", , " ]; then
+            # Formatar arquivos para Slack com backticks
+            formatted_files=$(echo "$FILES_WITH_SECRETS" | sed 's/\([^,]*\)/`\1`/g')
+            files_info="\n:file_folder: *Arquivos com segredos:* $formatted_files"
+            echo "✅ DEBUG: files_info definido: '$files_info'"
+          else
+            files_info=""
+            echo "❌ DEBUG: FILES_WITH_SECRETS vazio ou inválido: '$FILES_WITH_SECRETS'"
+          fi
+          
+          # Para PRs, buscar informações do último commit via API
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "📝 Buscando informações do último commit do PR..."
+            
+            COMMIT_INFO=$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}")
+            
+            COMMIT_AUTHOR=$(echo "$COMMIT_INFO" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('commit', {}).get('author', {}).get('name', 'Desconhecido'))" 2>/dev/null || echo "Desconhecido")
+            COMMIT_EMAIL=$(echo "$COMMIT_INFO" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('commit', {}).get('author', {}).get('email', 'email não disponível'))" 2>/dev/null || echo "email não disponível")
+            COMMIT_MESSAGE=$(echo "$COMMIT_INFO" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('commit', {}).get('message', 'Mensagem não disponível'))" 2>/dev/null || echo "Mensagem não disponível")
+            
+            PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+            channel_text=":warning: *TruffleHog encontrou possíveis segredos!*\n\n:point_right: *PR #${{ github.event.pull_request.number }}* no repositório \`${{ github.repository }}\`\n:bust_in_silhouette: *Autor do PR:* @${PR_AUTHOR}\n:memo: *Commit:* \`${COMMIT_SHA:0:7}\` por ${COMMIT_AUTHOR}\n:email: *Email:* ${COMMIT_EMAIL}\n:speech_balloon: *Mensagem:* ${COMMIT_MESSAGE}${files_info}\n\n:exclamation: Por favor, revise e remova qualquer segredo exposto antes de fazer merge!"
+          else
+            # Para push direto, usar as variáveis de evento
+            COMMIT_AUTHOR="${{ github.event.head_commit.author.name }}"
+            COMMIT_EMAIL="${{ github.event.head_commit.author.email }}"
+            COMMIT_MESSAGE="${{ github.event.head_commit.message }}"
+            
+            channel_text=":warning: *TruffleHog encontrou possíveis segredos!*\n\n:point_right: *Push na branch* \`${{ github.ref_name }}\` do repositório \`${{ github.repository }}\`\n:bust_in_silhouette: *Usuário:* @${GITHUB_USER}\n:memo: *Commit:* \`${COMMIT_SHA:0:7}\` por ${COMMIT_AUTHOR} (${COMMIT_EMAIL})\n:speech_balloon: *Mensagem:* ${COMMIT_MESSAGE}${files_info}\n\n:exclamation: Por favor, revise e remova qualquer segredo exposto!"
+          fi
+          
+          echo "📊 Informações capturadas:"
+          echo "👤 Usuário GitHub: $GITHUB_USER"
+          echo "✍️ Autor do commit: $COMMIT_AUTHOR"
+          echo "📧 Email: $COMMIT_EMAIL"
+          echo "💬 Mensagem: $COMMIT_MESSAGE"
+          echo "🔗 SHA: $COMMIT_SHA"
+          
+          # Enviar para o canal (webhook)
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            echo "📤 Enviando mensagem para o canal do Slack..."
+            channel_response=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-type: application/json' --data "{\"text\": \"$channel_text\"}" $SLACK_WEBHOOK_URL)
+            
+            if [ "$channel_response" == "200" ]; then
+              echo "✅ Mensagem enviada com sucesso para o canal do Slack!"
+            else
+              echo "❌ Erro ao enviar mensagem para o canal do Slack. Código: $channel_response"
+            fi
+          else
+            echo "⚠️ SLACK_WEBHOOK_URL não está configurado - pulando notificação do canal"
+          fi
+          
+          # Enviar DM para o autor do commit (se bot token estiver configurado)
+          if [ -n "$SLACK_BOT_TOKEN" ] && [ -n "$COMMIT_EMAIL" ] && [ "$COMMIT_EMAIL" != "null" ] && [ "$COMMIT_EMAIL" != "" ]; then
+            echo "📩 Tentando enviar DM para o autor do commit: $COMMIT_EMAIL"
+            
+            # Buscar usuário pelo email
+            user_response=$(curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              "https://slack.com/api/users.lookupByEmail?email=$COMMIT_EMAIL")
+            
+            user_id=$(echo "$user_response" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+            
+            if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
+              echo "👤 Usuário encontrado no Slack: $user_id"
+              
+              # Mensagem personalizada para DM
+              dm_text="🚨 *Olá ${COMMIT_AUTHOR}!*\n\nO TruffleHog detectou possíveis segredos em um commit que você fez:\n\n:memo: *Commit:* \`${COMMIT_SHA:0:7}\`\n:speech_balloon: *Mensagem:* ${COMMIT_MESSAGE}\n:file_folder: *Repositório:* ${{ github.repository }}${files_info}\n\n:warning: *Por favor, revise urgentemente e remova qualquer segredo exposto!*\n\n:information_source: Se você tem dúvidas sobre como remover segredos do histórico do Git, entre em contato com o time de segurança."
+              
+              # Enviar DM
+              dm_response=$(curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                -H "Content-type: application/json" \
+                -d "{\"channel\":\"$user_id\",\"text\":\"$dm_text\"}" \
+                "https://slack.com/api/chat.postMessage")
+              
+              if echo "$dm_response" | grep -q '"ok":true'; then
+                echo "✅ DM enviado com sucesso para $COMMIT_AUTHOR!"
+              else
+                echo "❌ Erro ao enviar DM. Resposta: $dm_response"
+              fi
+            else
+              echo "⚠️ Usuário com email $COMMIT_EMAIL não encontrado no Slack"
+              echo "🔍 Resposta da API: $user_response"
+            fi
+          else
+            echo "⚠️ SLACK_BOT_TOKEN não está configurado ou email não disponível - pulando envio de DM"
+          fi
+
+      - name: Falhar o workflow se segredos foram encontrados
+        if: steps.check_secrets.outputs.secrets_found == 'true'
+        run: |
+          echo "❌ Segredos foram encontrados! Verifique os logs acima."
+          exit 1

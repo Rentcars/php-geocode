@@ -1,0 +1,198 @@
+# TruffleHog OSS Monthly Current Files Scan
+# 
+# Este workflow executa um scan dos ARQUIVOS ATUAIS do repositório uma vez por mês
+# Executa todo dia 01 do mês às 09:00 UTC (06:00 BRT)
+# Scannea apenas os arquivos atuais, não o histórico de commits
+# 
+# IMPORTANTE: Executa APENAS na branch MASTER
+# - Schedule: automaticamente na branch master
+# - Manual: verificação força execução apenas na master
+#
+name: TruffleHog Monthly Current Files Scan
+
+on:
+  schedule:
+    - cron: '00 05 10 * *'
+  workflow_dispatch:
+    inputs:
+      notify_slack:
+        description: 'Enviar notificação para o Slack?'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  current-files-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch
+        run: |
+          echo "🔍 Verificando branch atual..."
+          echo "Branch atual: ${{ github.ref }}"
+          echo "Branch esperada: refs/heads/master"
+          
+          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            echo "❌ Este workflow só deve executar na branch master"
+            echo "Branch atual: ${{ github.ref }}"
+            exit 1
+          fi
+          
+          echo "✅ Executando na branch master correta"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        # Não precisa de fetch-depth: 0 pois vamos scanear apenas arquivos atuais
+
+      - name: System DateTime Info
+        run: |
+          echo "🕐 INFORMAÇÕES COMPLETAS DE DATA/HORA:"
+          echo "========================================"
+          echo "🌍 UTC:           $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "🕐 Local:         $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "🌐 Timezone:      $(cat /etc/timezone || echo 'N/A')"
+          echo "📍 Offset:        $(date '+%z')"
+          echo "🔢 Timestamp:     $(date +%s)"
+          echo "🏗️ Sistema:       $(uname -a)"
+          echo "🐧 OS:            $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "========================================"
+
+      - name: Run TruffleHog Current Files Scan
+        id: trufflehog-current
+        run: |
+          echo "🔍 Iniciando scan dos ARQUIVOS ATUAIS do repositório..."
+          echo "📅 Data/Hora do servidor GitHub Actions:"
+          echo "  🌍 UTC: $(date -u)"
+          echo "  🕐 Local: $(date)"
+          echo "  🌐 Timezone: $(date +%Z)"
+          echo "  📍 Offset: $(date +%z)"
+          echo "📂 Repositório: ${{ github.repository }}"
+          echo "📋 Modo: Arquivos atuais (não histórico de commits)"
+          
+          # Executa TruffleHog nos arquivos atuais (filesystem scan)
+          # Exclui a pasta .git para evitar falsos positivos
+          docker run --rm -v .:/tmp -w /tmp \
+            ghcr.io/trufflesecurity/trufflehog:latest \
+            filesystem /tmp/ \
+            --json \
+            --no-update \
+            --exclude-paths=/tmp/.git \
+            --github-actions 2>/tmp/current_scan_logs.txt 1>/tmp/current_scan_secrets.json || echo "TruffleHog current files scan completed"
+          
+          # Processa os resultados dos arquivos atuais
+          secrets_data=$(cat /tmp/current_scan_secrets.json | grep '"SourceMetadata"' || echo "")
+          
+          if [ -n "$secrets_data" ]; then
+            secrets_count=$(echo "$secrets_data" | wc -l)
+            echo "🚨 TOTAL DE SEGREDOS ENCONTRADOS: $secrets_count"
+            
+            # Extrai arquivos únicos e filtra arquivos da pasta .git
+            files_with_secrets=$(echo "$secrets_data" | grep -o '"file":"[^"]*' | cut -d'"' -f4 | grep -v '\.git/' | sed 's|^/tmp/||' | sort -u)
+            files_count=$(echo "$files_with_secrets" | wc -l)
+            
+            # Extrai tipos de detectores únicos
+            detector_types=$(echo "$secrets_data" | grep -o '"DetectorName":"[^"]*' | cut -d'"' -f4 | sort -u)
+            
+            echo "📊 RESUMO DO SCAN (ARQUIVOS ATUAIS):"
+            echo "🔢 Total de segredos: $secrets_count"
+            echo "📁 Arquivos afetados: $files_count"
+            
+            # Prepara dados para o output
+            files_list=$(echo "$files_with_secrets" | head -20 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+            detectors_list=$(echo "$detector_types" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+            
+            echo "secrets_found=true" >> $GITHUB_OUTPUT
+            echo "total_secrets=$secrets_count" >> $GITHUB_OUTPUT
+            echo "files_affected=$files_count" >> $GITHUB_OUTPUT
+            echo "files_list=$files_list" >> $GITHUB_OUTPUT
+            echo "detectors_list=$detectors_list" >> $GITHUB_OUTPUT
+          else
+            echo "✅ NENHUM SEGREDO ENCONTRADO nos arquivos atuais!"
+            echo "secrets_found=false" >> $GITHUB_OUTPUT
+            echo "total_secrets=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Send Monthly Report to Slack
+        if: inputs.notify_slack != false || github.event_name == 'schedule'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.TRUFFLEHOG_SLACK_WEBHOOK_URL }}
+        run: |
+          echo "🔔 Verificando se deve enviar notificação para Slack..."
+          echo "Event name: ${{ github.event_name }}"
+          echo "Notify slack input: ${{ inputs.notify_slack }}"
+          
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "⚠️ SLACK_WEBHOOK_URL não configurado - pulando notificação"
+            exit 0
+          fi
+          
+          SECRETS_FOUND="${{ steps.trufflehog-current.outputs.secrets_found }}"
+          TOTAL_SECRETS="${{ steps.trufflehog-current.outputs.total_secrets }}"
+          FILES_AFFECTED="${{ steps.trufflehog-current.outputs.files_affected }}"
+          FILES_LIST="${{ steps.trufflehog-current.outputs.files_list }}"
+          DETECTORS_LIST="${{ steps.trufflehog-current.outputs.detectors_list }}"
+          
+          if [ "$SECRETS_FOUND" == "true" ]; then
+            slack_text="🚨 *RELATÓRIO MENSAL DE SEGURANÇA*\n\n"
+            slack_text+="📅 *Data:* $(date '+%d/%m/%Y')\n"
+            slack_text+="📁 *Repositório:* \`${{ github.repository }}\`\n"
+            slack_text+="🔍 *Tipo:* Scan dos Arquivos Atuais\n\n"
+            slack_text+="⚠️ *SEGREDOS ENCONTRADOS:*\n"
+            slack_text+="🔢 *Total:* $TOTAL_SECRETS segredos\n"
+            slack_text+="📂 *Arquivos afetados:* $FILES_AFFECTED\n\n"
+            
+            if [ -n "$FILES_LIST" ]; then
+              slack_text+="📄 *Arquivos:* \`$FILES_LIST\`\n\n"
+            fi
+            
+            if [ -n "$DETECTORS_LIST" ]; then
+              slack_text+="🕵️ *Tipos detectados:* \`$DETECTORS_LIST\`\n\n"
+            fi
+            
+            slack_text+="❗ *AÇÃO NECESSÁRIA:*\n"
+            slack_text+="• Revisar e remover segredos dos arquivos atuais\n"
+            slack_text+="• Verificar se credenciais precisam ser rotacionadas\n"
+            slack_text+="• Considerar adicionar ao .gitignore ou .trufflehogignore\n\n"
+            slack_text+="🔗 *Logs:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            slack_text="✅ *RELATÓRIO MENSAL DE SEGURANÇA*\n\n"
+            slack_text+="📅 *Data:* $(date '+%d/%m/%Y')\n"
+            slack_text+="📁 *Repositório:* \`${{ github.repository }}\`\n"
+            slack_text+="🔍 *Tipo:* Scan dos Arquivos Atuais\n\n"
+            slack_text+="🎉 *RESULTADO: ARQUIVOS ATUAIS LIMPOS*\n"
+            slack_text+="Nenhum segredo foi detectado nos arquivos atuais.\n\n"
+            slack_text+="🛡️ *Status de Segurança:* Excelente"
+          fi
+          
+          echo "📤 Enviando relatório mensal para o Slack..."
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H 'Content-type: application/json' \
+            --data "{\"text\": \"$slack_text\"}" \
+            "$SLACK_WEBHOOK_URL")
+          
+          if [ "$response" == "200" ]; then
+            echo "✅ Relatório mensal enviado com sucesso!"
+          else
+            echo "❌ Erro ao enviar relatório. Código: $response"
+          fi
+
+      - name: Create Summary
+        run: |
+          echo "## 📊 Resumo do Scan Mensal (Arquivos Atuais)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Data:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositório:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tipo:** Scan dos Arquivos Atuais" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.trufflehog-current.outputs.secrets_found }}" == "true" ]; then
+            echo "### 🚨 Segredos Encontrados nos Arquivos Atuais" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Total:** ${{ steps.trufflehog-current.outputs.total_secrets }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Arquivos:** ${{ steps.trufflehog-current.outputs.files_affected }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ Arquivos Atuais Limpos" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🎉 Nenhum segredo foi encontrado nos arquivos atuais!" >> $GITHUB_STEP_SUMMARY
+          fi
